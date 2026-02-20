@@ -1,0 +1,14 @@
+name "assetflip2"
+description "FPS Game ported to D with raylib"
+authors "Monkyyy"
+copyright "Copyright © 2026, Monkyyy"
+license "MIT"
+
+dependency "raylib-d" version="~>5.5.0"
+
+targetType "executable"
+
+buildOptions "debugMode"
+dflags "-m64"
+lflags "-L/usr/lib"
+libs "raylib"
