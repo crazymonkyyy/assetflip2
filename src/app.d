@@ -8,6 +8,7 @@ import std.random;
 import std.array;
 import std.math : sqrt, cos, sin, PI;
 import core.stdc.string;
+import collision;
 
 // ============================================================================
 // Constants
@@ -26,6 +27,7 @@ enum ASSET_PATH = "../assetflip/";
 enum MODEL_PATH = ASSET_PATH ~ "models/";
 enum SOUND_PATH = ASSET_PATH ~ "sounds/";
 enum SPRITE_PATH = ASSET_PATH ~ "sprites/";
+enum SHADER_PATH = "shaders/";
 
 // Colors
 enum Color MAROON = Color(128, 0, 0, 255);
@@ -327,16 +329,18 @@ class Player {
     int numberOfJumps;
     bool onFloor;
     bool previouslyFloored;
-    
+
     Camera3D camera;
     Weapon[] weapons;
     int weaponIndex;
     Weapon currentWeapon;
-    
+
     float weaponRecoilZ;
     float containerOffsetZ;
     float weaponSwayTime;
     
+    CollisionController collisionController;
+
     this() {
         position = Vector3(0, 0.5f, 0);
         velocity = Vector3Zero();
@@ -352,17 +356,20 @@ class Player {
         weaponRecoilZ = 0;
         containerOffsetZ = -0.5f;
         weaponSwayTime = 0;
-        
+
+        // Initialize collision controller (capsule: radius 0.3, height 1.0)
+        collisionController = new CollisionController(position, 0.3f, 1.0f);
+
         camera.fovy = 80.0f;
         camera.up = Vector3Up();
         camera.position = position;
         camera.target = Vector3Add(position, Vector3(0, 1, 0));
         camera.projection = CAMERA_PERSPECTIVE;
-        
+
         weapons = [];
         weaponIndex = 0;
     }
-    
+
     void addWeapon(Weapon weapon) {
         weapons ~= weapon;
         if (weapons.length == 1) {
@@ -370,38 +377,54 @@ class Player {
         }
     }
     
+    void addCollider(Model model, Matrix transform) {
+        collisionController.addCollider(model, transform);
+    }
+
     void update(float dt) {
         foreach (weapon; weapons) {
             weapon.update(dt);
         }
-        
+
         gravity += GRAVITY * dt;
-        
-        if (gravity > 0 && onFloor) {
-            jumpsRemaining = numberOfJumps;
-            gravity = 0;
-        }
-        
+
         handleInput(dt);
-        
+
+        // Calculate desired velocity
         Vector3 appliedVelocity = Vector3Lerp(velocity, movementVelocity, dt * 10);
         appliedVelocity.y = -gravity;
         velocity = appliedVelocity;
+
+        // Update collision controller position
+        collisionController.position = position;
+        collisionController.velocity = appliedVelocity;
         
-        position = Vector3Add(position, Vector3Scale(appliedVelocity, dt));
+        // Update with collision detection
+        collisionController.update(dt);
         
-        if (position.y <= 0.5f) {
-            position.y = 0.5f;
-            onFloor = true;
+        // Get new position from collision controller
+        Vector3 newPos = collisionController.position;
+        
+        // Check if grounded
+        bool wasGrounded = onFloor;
+        onFloor = collisionController.isGrounded() || newPos.y <= 0.5f;
+        
+        if (onFloor) {
+            if (newPos.y <= 0.5f) {
+                newPos.y = 0.5f;
+            }
             if (gravity > 1 && !previouslyFloored) {
                 audio.play("land");
             }
+            jumpsRemaining = numberOfJumps;
+            gravity = 0;
         } else {
             onFloor = false;
         }
         
+        position = newPos;
         previouslyFloored = onFloor;
-        
+
         camera.position = position;
         Vector3 lookTarget = Vector3Add(position, Vector3(
             sin(rotationY) * cos(rotationX),
@@ -409,7 +432,7 @@ class Player {
             cos(rotationY) * cos(rotationX)
         ));
         camera.target = lookTarget;
-        
+
         weaponSwayTime += dt;
         float swayAmount = Vector3Length(appliedVelocity) / PLAYER_SPEED * 0.03f;
         weaponRecoilZ = containerOffsetZ + swayAmount * sin(weaponSwayTime * 10);
@@ -570,6 +593,30 @@ struct Platform {
 }
 
 // ============================================================================
+// Decoration (trees, rocks, props)
+// ============================================================================
+struct Decoration {
+    Vector3 position;
+    Model model;
+    float scale;
+    float rotationY;
+    
+    this(Vector3 pos, Model mdl, float scl = 1.0f, float rot = 0) {
+        position = pos;
+        model = mdl;
+        scale = scl;
+        rotationY = rot;
+    }
+    
+    void draw() {
+        if (model.meshes !is null) {
+            DrawModelEx(model, position, Vector3(0, 1, 0), rotationY, 
+                Vector3(scale, scale, scale), WHITE);
+        }
+    }
+}
+
+// ============================================================================
 // Asset Manager
 // ============================================================================
 class AssetManager {
@@ -577,14 +624,21 @@ class AssetManager {
     string[] modelNames;
     Texture2D[] textures;
     string[] textureNames;
-    
+    Shader moodyShader;
+    Shader postShader;
+    RenderTexture2D renderTarget;
+    float time;
+
     this() {
         models = [];
         modelNames = [];
         textures = [];
         textureNames = [];
+        moodyShader = Shader.init;
+        postShader = Shader.init;
+        time = 0;
     }
-    
+
     ~this() {
         foreach (model; models) {
             if (model.meshes !is null) {
@@ -596,15 +650,49 @@ class AssetManager {
                 UnloadTexture(texture);
             }
         }
+        if (moodyShader.id != 0) {
+            UnloadShader(moodyShader);
+        }
+        if (postShader.id != 0) {
+            UnloadShader(postShader);
+        }
+        if (renderTarget.id != 0) {
+            UnloadRenderTexture(renderTarget);
+        }
     }
-    
+
+    void loadShaders() {
+        // Load moody shader
+        moodyShader = LoadShader(
+            (SHADER_PATH ~ "moody.vert").ptr,
+            (SHADER_PATH ~ "moody.frag").ptr
+        );
+        
+        // Load post-processing shader
+        postShader = LoadShader(
+            null,
+            (SHADER_PATH ~ "moody_post.frag").ptr
+        );
+        
+        // Create render target for post-processing
+        renderTarget = LoadRenderTexture(SCREEN_WIDTH, SCREEN_HEIGHT);
+    }
+
     Model loadModel(string name, string path) {
         Model model = LoadModel(path.ptr);
+        
+        // Apply moody shader to all materials
+        if (moodyShader.id != 0) {
+            for (int i = 0; i < model.materialCount; i++) {
+                model.materials[i].shader = moodyShader;
+            }
+        }
+        
         models ~= model;
         modelNames ~= name;
         return model;
     }
-    
+
     Model getModel(string name) {
         for (size_t i = 0; i < modelNames.length; i++) {
             if (modelNames[i] == name) {
@@ -613,14 +701,14 @@ class AssetManager {
         }
         return Model.init;
     }
-    
+
     Texture2D loadTexture(string name, string path) {
         Texture2D texture = LoadTexture(path.ptr);
         textures ~= texture;
         textureNames ~= name;
         return texture;
     }
-    
+
     Texture2D getTexture(string name) {
         for (size_t i = 0; i < textureNames.length; i++) {
             if (textureNames[i] == name) {
@@ -628,6 +716,25 @@ class AssetManager {
             }
         }
         return Texture2D.init;
+    }
+    
+    void updateShaderUniforms(Vector3 viewPos) {
+        time += 0.016f;
+        
+        if (moodyShader.id != 0) {
+            SetShaderValue(moodyShader, GetShaderLocation(moodyShader, "viewPos"), &viewPos, ShaderUniformDataType.SHADER_UNIFORM_VEC3);
+            SetShaderValue(moodyShader, GetShaderLocation(moodyShader, "time"), &time, ShaderUniformDataType.SHADER_UNIFORM_FLOAT);
+            Vector2 screenSize = Vector2(SCREEN_WIDTH, SCREEN_HEIGHT);
+            SetShaderValue(moodyShader, GetShaderLocation(moodyShader, "screenSize"), 
+                &screenSize, ShaderUniformDataType.SHADER_UNIFORM_VEC2);
+        }
+        
+        if (postShader.id != 0) {
+            SetShaderValue(postShader, GetShaderLocation(postShader, "time"), &time, ShaderUniformDataType.SHADER_UNIFORM_FLOAT);
+            Vector2 screenSize = Vector2(SCREEN_WIDTH, SCREEN_HEIGHT);
+            SetShaderValue(postShader, GetShaderLocation(postShader, "screenSize"), 
+                &screenSize, ShaderUniformDataType.SHADER_UNIFORM_VEC2);
+        }
     }
 }
 
@@ -638,6 +745,7 @@ class Game {
     Player player;
     Enemy[] enemies;
     Platform[] platforms;
+    Decoration[] decorations;
     AssetManager assets;
     int score;
     bool paused;
@@ -648,9 +756,10 @@ class Game {
         player = new Player();
         enemies = [];
         platforms = [];
+        decorations = [];
         score = 0;
         paused = false;
-        
+
         loadAssets();
         createLevel();
     }
@@ -660,32 +769,35 @@ class Game {
     }
     
     void loadAssets() {
+        // Load shaders first
+        assets.loadShaders();
+        
         // Load weapon models
         Model blasterModel = assets.loadModel("blaster", MODEL_PATH ~ "blaster.glb");
         Model repeaterModel = assets.loadModel("blaster-repeater", MODEL_PATH ~ "blaster-repeater.glb");
-        
+
         // Load enemy model
         Model enemyModel = assets.loadModel("enemy", MODEL_PATH ~ "enemy-flying.glb");
-        
+
         // Load platform models
         Model platformModel = assets.loadModel("platform", MODEL_PATH ~ "platform.glb");
         Model wallLowModel = assets.loadModel("wall-low", MODEL_PATH ~ "wall-low.glb");
         Model wallHighModel = assets.loadModel("wall-high", MODEL_PATH ~ "wall-high.glb");
-        
+
         // Load crosshair textures
         Texture2D blasterCrosshair = assets.loadTexture("crosshair", SPRITE_PATH ~ "crosshair.png");
         Texture2D repeaterCrosshair = assets.loadTexture("crosshair-repeater", SPRITE_PATH ~ "crosshair-repeater.png");
-        
+
         // Load skybox
         skybox = LoadTexture((SPRITE_PATH ~ "skybox.png").ptr);
-        
+
         // Create weapons with models
-        player.addWeapon(new Weapon("Blaster", blasterModel, 
+        player.addWeapon(new Weapon("Blaster", blasterModel,
             Vector3(0.3f, -0.25f, -0.5f), Vector3(0, 180, 0), Vector3(0.3f, -0.2f, -0.8f),
-            0.15f, 50.0f, 25.0f, 0.5f, 1, 20.0f, 
-            Vector2(0.001f, 0.001f), Vector2(0.0025f, 0.002f), 
+            0.15f, 50.0f, 25.0f, 0.5f, 1, 20.0f,
+            Vector2(0.001f, 0.001f), Vector2(0.0025f, 0.002f),
             "blaster", GREEN, blasterCrosshair));
-        
+
         player.addWeapon(new Weapon("Repeater", repeaterModel,
             Vector3(0.3f, -0.25f, -0.5f), Vector3(0, 180, 0), Vector3(0.3f, -0.2f, -0.8f),
             0.1f, 40.0f, 15.0f, 1.0f, 3, 15.0f,
@@ -694,25 +806,113 @@ class Game {
     }
     
     void createLevel() {
+        // Load decorative models
+        Model grassModel = assets.loadModel("grass", MODEL_PATH ~ "grass.glb");
+        Model grassSmallModel = assets.loadModel("grass-small", MODEL_PATH ~ "grass-small.glb");
+        Model crateModel = assets.loadModel("crate", MODEL_PATH ~ "crate-small.glb");
+        Model cloudModel = assets.loadModel("cloud", MODEL_PATH ~ "cloud.glb");
+        Model stairsModel = assets.loadModel("stairs", "models/stairs.glb");
+
         // Ground platform
         platforms ~= Platform(Vector3(0, -0.5f, 0), Vector3(20, 1, 20), DARKGREEN);
-        
+
         // Various platforms
         platforms ~= Platform(Vector3(-5, 1, 5), Vector3(4, 0.5f, 4), BROWN);
         platforms ~= Platform(Vector3(5, 2, -5), Vector3(4, 0.5f, 4), BROWN);
         platforms ~= Platform(Vector3(-8, 3, -8), Vector3(4, 0.5f, 4), BROWN);
         platforms ~= Platform(Vector3(8, 1.5f, 8), Vector3(4, 0.5f, 4), BROWN);
-        
+
         // Walls
         platforms ~= Platform(Vector3(-10, 1, 0), Vector3(1, 2, 10), GRAY);
         platforms ~= Platform(Vector3(10, 1, 0), Vector3(1, 2, 10), GRAY);
         platforms ~= Platform(Vector3(0, 1, -10), Vector3(20, 2, 1), GRAY);
+
+        // Add staircase using GLB model (leads up to platform at -5, 1, 5)
+        decorations ~= Decoration(Vector3(-7, 0, 3), stairsModel, 1.0f, -PI/4);
+        platforms ~= Platform(Vector3(-7, 0, 3), stairsModel);
+
+        // Add decorations (grass, crates as rocks, clouds as trees/bushes)
+        // Grass patches
+        for (int i = 0; i < 30; i++) {
+            float x = (GetRandomValue(0, 100) / 10.0f) - 5.0f;
+            float z = (GetRandomValue(0, 100) / 10.0f) - 5.0f;
+            float rot = GetRandomValue(0, 360) * PI / 180;
+            float scale = 0.5f + GetRandomValue(0, 50) / 100.0f;
+            
+            // Don't place on spawn area or stairs
+            if (Vector3Length(Vector3(x, 0, z)) > 2.0f && Vector3Length(Vector3(x + 7, 0, z - 3)) > 1.5f) {
+                decorations ~= Decoration(Vector3(x, 0, z), grassModel, scale, rot);
+            }
+        }
+        
+        // Crates as "rocks"
+        decorations ~= Decoration(Vector3(-3, 0.3f, 3), crateModel, 1.0f, PI / 4);
+        decorations ~= Decoration(Vector3(4, 0.3f, -4), crateModel, 1.2f, PI / 6);
+        decorations ~= Decoration(Vector3(-6, 0.3f, -2), crateModel, 0.8f, PI / 3);
+        decorations ~= Decoration(Vector3(2, 2.3f, -3), crateModel, 1.0f, PI / 8);
+        
+        // Clouds as "trees/bushes" (scaled down)
+        decorations ~= Decoration(Vector3(-7, 0.5f, 4), cloudModel, 0.4f, 0);
+        decorations ~= Decoration(Vector3(6, 0.5f, 6), cloudModel, 0.5f, PI / 4);
+        decorations ~= Decoration(Vector3(-4, 4.3f, 8), cloudModel, 0.35f, PI / 6);
+        decorations ~= Decoration(Vector3(7, 0.5f, -7), cloudModel, 0.45f, PI / 3);
+        
+        // Add more grass on platforms
+        decorations ~= Decoration(Vector3(-5, 1.3f, 5), grassSmallModel, 1.5f, PI / 4);
+        decorations ~= Decoration(Vector3(5, 2.3f, -5), grassSmallModel, 1.5f, PI / 6);
         
         // Add enemies
         enemies ~= new Enemy(Vector3(-5, 3, 5), assets.getModel("enemy"));
         enemies ~= new Enemy(Vector3(5, 4, -5), assets.getModel("enemy"));
         enemies ~= new Enemy(Vector3(-8, 5, -8), assets.getModel("enemy"));
         enemies ~= new Enemy(Vector3(8, 3, 8), assets.getModel("enemy"));
+        
+        // Add colliders for player
+        // Platforms (using simple boxes for collision)
+        addPlatformCollider(Vector3(-5, 1, 5), Vector3(4, 0.5f, 4));
+        addPlatformCollider(Vector3(5, 2, -5), Vector3(4, 0.5f, 4));
+        addPlatformCollider(Vector3(-8, 3, -8), Vector3(4, 0.5f, 4));
+        addPlatformCollider(Vector3(8, 1.5f, 8), Vector3(4, 0.5f, 4));
+        
+        // Walls
+        addPlatformCollider(Vector3(-10, 1, 0), Vector3(1, 2, 10));
+        addPlatformCollider(Vector3(10, 1, 0), Vector3(1, 2, 10));
+        addPlatformCollider(Vector3(0, 1, -10), Vector3(20, 2, 1));
+        
+        // Stairs collider using mesh
+        addStairsCollider(Vector3(-7, 0, 3), -PI/4);
+        
+        // Crates as collision objects
+        addCrateCollider(Vector3(-3, 0.3f, 3));
+        addCrateCollider(Vector3(4, 0.3f, -4));
+        addCrateCollider(Vector3(-6, 0.3f, -2));
+        addCrateCollider(Vector3(2, 2.3f, -3));
+    }
+    
+    void addStairsCollider(Vector3 pos, float rotationY) {
+        Model stairsModel = assets.getModel("stairs");
+        if (stairsModel.meshes !is null) {
+            Matrix transform = MatrixRotateY(rotationY);
+            transform = MatrixMultiply(transform, MatrixTranslate(pos.x, pos.y, pos.z));
+            player.addCollider(stairsModel, transform);
+        }
+    }
+    
+    void addPlatformCollider(Vector3 pos, Vector3 size) {
+        // Create a simple box mesh for collision
+        Mesh boxMesh = GenMeshCube(size.x, size.y, size.z);
+        Model boxModel = LoadModelFromMesh(boxMesh);
+        
+        Matrix transform = MatrixTranslate(pos.x, pos.y, pos.z);
+        player.addCollider(boxModel, transform);
+    }
+    
+    void addCrateCollider(Vector3 pos) {
+        Model crateModel = assets.getModel("crate");
+        if (crateModel.meshes !is null) {
+            Matrix transform = MatrixTranslate(pos.x, pos.y, pos.z);
+            player.addCollider(crateModel, transform);
+        }
     }
     
     void update(float dt) {
@@ -765,27 +965,52 @@ class Game {
     }
     
     void draw() {
-        BeginDrawing();
-        ClearBackground(RAYWHITE);
-        
+        // Update shader uniforms
+        assets.updateShaderUniforms(player.camera.position);
+
+        // Render to texture for post-processing
+        BeginTextureMode(assets.renderTarget);
+        ClearBackground(Color(10, 10, 20, 255));
+
         BeginMode3D(player.camera);
-        
-        // Draw skybox effect (large sphere)
-        DrawSphere(player.position, 50.0f, Color(100, 150, 200, 255));
-        
+
+        // Dark foggy background
+        DrawSphere(player.position, 50.0f, Color(30, 30, 50, 255));
+
         foreach (platform; platforms) {
             platform.draw();
         }
-        
+
+        foreach (decoration; decorations) {
+            decoration.draw();
+        }
+
         foreach (enemy; enemies) {
             enemy.draw();
         }
-        
+
         player.draw();
-        
+
         EndMode3D();
         
+        // Draw HUD to render texture too
         drawHUD();
+        
+        EndTextureMode();
+        
+        // Apply post-processing shader and draw to screen
+        BeginDrawing();
+        ClearBackground(BLACK);
+        
+        // Draw the rendered texture with post-processing shader
+        BeginShaderMode(assets.postShader);
+        DrawTextureRec(
+            assets.renderTarget.texture,
+            Rectangle(0, 0, SCREEN_WIDTH, -SCREEN_HEIGHT),
+            Vector2(0, 0),
+            WHITE
+        );
+        EndShaderMode();
         
         if (paused) {
             DrawRectangle(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, Color(0, 0, 0, 180));
